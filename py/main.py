@@ -2,13 +2,18 @@
 import ssl
 import sys
 import time
-import socket
 import random
+import socket
 import asyncio
 import functools
 import traceback
 import collections
-import h2.config, h2.connection, h2.events, h2.errors, h2.settings
+
+import h2.config
+import h2.errors
+import h2.events
+import h2.settings
+import h2.connection
 
 eprint = functools.partial(print, file=sys.stderr)
 dprint = functools.partial(print, file=sys.stderr)
@@ -30,7 +35,7 @@ class ProxyError(Exception):
         super().__init__(f'proxy error {code}')
 
     @classmethod
-    def build(cls, code):
+    def check(cls, code):
         return ProxyError(h2.errors.ErrorCodes(code)) if code else None
 
 class StreamWriter:
@@ -187,9 +192,9 @@ class BaseConnection:
                 elif isinstance(e, h2.events.StreamEnded):
                     self.end(e.stream_id, None)
                 elif isinstance(e, h2.events.StreamReset):
-                    self.end(e.stream_id, ProxyError.build(e.error_code))
+                    self.end(e.stream_id, ProxyError.check(e.error_code))
                 elif isinstance(e, h2.events.ConnectionTerminated):
-                    if err := ProxyError.build(e.error_code):
+                    if err := ProxyError.check(e.error_code):
                         raise err
                     return
             self.sender.attempt()
@@ -219,7 +224,7 @@ class ClientConn(BaseConnection):
 
     @property
     def available(self):
-        return len(self.streams) < 3 and self.task
+        return len(self.streams) < 8 and self.task
 
     @classmethod
     async def make(cls, host, port, path):
@@ -227,9 +232,13 @@ class ClientConn(BaseConnection):
         return ClientConn(r, w, host, path)
 
     def tunnel(self, host, port):
+        headers = self.headers + (
+            ('remote-target', f'{host}:{port}'),
+            ('random-nonce', 'A' * random.randrange(32)),
+        )
+
         sid = self.http.get_next_available_stream_id()
         sw = self.streams[sid] = StreamWriter(sid, self)
-        headers = self.headers + (('remote-host', host), ('remote-port', str(port)))
         self.http.send_headers(sid, headers)
         self.send()
         return sw.reader, sw
@@ -238,6 +247,7 @@ class ClientTunnel:
     def __init__(self, server):
         self.server = server
         self.pool = []
+        self.lock = asyncio.Lock()
         self.timeout = Timeouter('client', 300)
 
     async def connect(self, host, port):
@@ -245,17 +255,18 @@ class ClientTunnel:
         return conn.tunnel(host, port)
 
     async def acquire(self):
-        for c in self.pool:
-            if c.available:
-                dprint('client', 'pool.reuse', c.i)
-                return c
+        async with self.lock:
+            for c in self.pool:
+                if c.available:
+                    dprint('client', 'pool.reuse', c.i)
+                    return c
 
-        conn = await ClientConn.make(*self.server)
-        self.pool.append(conn)
-        self.timeout.register(conn)
-        conn.run().add_done_callback(lambda _: self.pool.remove(conn))
-        dprint('client', 'pool.new', conn.i)
-        return conn
+            conn = await ClientConn.make(*self.server)
+            self.pool.append(conn)
+            self.timeout.register(conn)
+            conn.run().add_done_callback(lambda _: self.pool.remove(conn))
+            dprint('client', 'pool.new', conn.i)
+            return conn
 
 class Timeouter:
     def __init__(self, role, timeout):
@@ -397,12 +408,12 @@ class ServerConn(BaseConnection):
 
     async def address(self, headers):
         host, port = '', 0
-        for k, v in headers:
-            if k == 'remote-host':
-                host = v
-            elif k == 'remote-port':
-                port = int(v)
-        assert host and port, (host, port)
+        try:
+            value = next((v for k, v in headers if k == 'remote-target'), '')
+            h, p = value.rsplit(':', 1)
+            host, port = h, int(p)
+        except Exception as e:
+            assert False, e
         dprint('server', 'req.addr', host, port)
         return host, port
 
@@ -421,8 +432,8 @@ async def main():
     match sys.argv:
         case (_, 'server', port):
             await Server().serve(int(port))
-        case (_, 'client', host, path, port):
-            await Client((host, 443, path), Rules()).serve(int(port))
+        case (_, 'client', lport, host, rport, path):
+            await Client((host, rport, path), Rules()).serve(int(lport))
         case (_, 'test', port):
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(Server().serve(21993))
